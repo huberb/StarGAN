@@ -4,9 +4,10 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, ConcatDataset
 from torchvision.utils import save_image
 from tensorboardX import SummaryWriter
+from torch.nn.functional import binary_cross_entropy_with_logits
 
 from dataloader import AnimeDataset, CelebADataset
-from original_networks import Generator, Discriminator
+from networks import Generator, Discriminator
 
 import shutil
 import os
@@ -33,14 +34,18 @@ def gradient_penalty(y, x, device):
     return torch.mean((dydx_l2norm-1)**2)
 
 
-def classification_loss(logit, target):
-    return torch.nn.functional.binary_cross_entropy_with_logits(logit, target, size_average=False) / logit.size(0)
+def loss(logit, target):
+    bce = binary_cross_entropy_with_logits(logit, target, size_average=False)
+    return bce / logit.size(0)
 
 
-def train(generator, discriminator, batch_size=32, num_batches=10000,
-          device='cuda', log_interval=25, log_dir="./logs"):
+def train(generator, discriminator, batch_size=32, num_batches=20000,
+          critic_iter=5, device='cuda', log_interval=100, log_dir="./logs"):
+
+    torch.manual_seed(42)
+
     test_loader = yield_infinite(
-            DataLoader(CelebADataset(amount=8), batch_size=8)
+            DataLoader(CelebADataset(amount=16), batch_size=16)
             )
 
     mixed_dataset = ConcatDataset(
@@ -71,7 +76,7 @@ def train(generator, discriminator, batch_size=32, num_batches=10000,
         real_images = (real_images - 0.5) * 2
         predicted_source, predicted_classes = discriminator(real_images)
         d_loss_real = - torch.mean(predicted_source)
-        d_loss_class = classification_loss(predicted_classes, classes)
+        d_loss_class = loss(predicted_classes, classes)
 
         # compute loss on fake images
         target_classes = 1 - classes
@@ -81,7 +86,8 @@ def train(generator, discriminator, batch_size=32, num_batches=10000,
 
         # gradient penalty
         alpha = torch.rand(real_images.size(0), 1, 1, 1).to(device)
-        x_hat = (alpha * real_images + (1 - alpha) * fake_images).requires_grad_(True)
+        x_hat = (alpha * real_images + (1 - alpha) * fake_images)
+        x_hat = x_hat.requires_grad_(True)
         out_src, _ = discriminator(x_hat)
         d_loss_gp = gradient_penalty(out_src, x_hat, device) * 10
 
@@ -92,17 +98,19 @@ def train(generator, discriminator, batch_size=32, num_batches=10000,
         d_loss.backward()
         disc_optim.step()
 
-        if index > 0 and index % 5 == 0:
+        if index > 0 and index % critic_iter == 0:
             # original to target
             generator.zero_grad()
             fake_images = generator(real_images, target_classes)
             predicted_source, predicted_classes = discriminator(fake_images)
             g_loss_fake = - torch.mean(predicted_source)
-            g_loss_class = classification_loss(predicted_classes, target_classes)
+            g_loss_class = loss(predicted_classes, target_classes)
 
             # target to original
             reconstruction = generator(fake_images, classes)
-            g_loss_reconstruction = torch.mean(torch.abs(real_images - reconstruction)) * 10
+            g_loss_reconstruction = torch.mean(
+                    torch.abs(real_images - reconstruction)
+                    ) * 10
 
             # apply gradients
             g_loss = g_loss_fake + g_loss_reconstruction + g_loss_class
@@ -111,29 +119,42 @@ def train(generator, discriminator, batch_size=32, num_batches=10000,
             g_loss.backward()
             gen_optim.step()
 
+            # save losses
             g_losses.append(g_loss.item())
             d_losses.append(d_loss.item())
             writer.add_scalar("d_loss", d_loss, global_step=index)
             writer.add_scalar("g_loss", g_loss, global_step=index)
             writer.flush()
 
-        if index % log_interval == 0:
-            print(f"loss gen: {torch.Tensor(g_losses)[-100:].mean()}, loss disc: {torch.Tensor(d_losses)[-100:].mean()}")
+        if index > 0 and index % log_interval == 0:
+            print(f"index: {index} \
+                    loss gen: {torch.Tensor(g_losses)[-100:].mean()},\
+                    loss disc: {torch.Tensor(d_losses)[-100:].mean()}")
+
             with torch.no_grad():
                 test_images = (next(test_loader)[0] - 0.5) * 2
-                fake_images = generator(test_images.to(device), torch.ones(len(test_images), 1).to(device))
-                reconstruction = generator(fake_images, torch.zeros(len(test_images), 1).to(device))
-                collection = torch.cat([test_images, fake_images.detach().cpu(), reconstruction.detach().cpu()])
+
+                ones = torch.ones(len(test_images), 1).to(device)
+                zeros = torch.zeros(len(test_images), 1).to(device)
+
+                fake_images = generator(test_images.to(device), ones)
+                reconstruction = generator(fake_images, zeros)
+
+                collection = torch.cat([test_images,
+                                        fake_images.detach().cpu(),
+                                        reconstruction.detach().cpu()])
                 collection = (collection * 0.5) + 0.5
-                save_image(collection, "fake.png")
+                save_image(collection, "fake.png", nrow=16)
+
+    # save models after training
+    torch.save(generator, "generator.pt")
+    torch.save(discriminator, "discriminator.pt")
 
 
 if __name__ == "__main__":
     generator = Generator().to('cuda')
     discriminator = Discriminator().to('cuda')
 
-    # discriminator.summary()
-    # generator.summary()
     torchsummary.summary(generator, (3, 64, 64))
     torchsummary.summary(discriminator, (3, 64, 64))
 

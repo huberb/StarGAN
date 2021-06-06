@@ -1,93 +1,105 @@
 import torch
 import torch.nn as nn
-from torchsummary import summary
+import numpy as np
 
 
-class Discriminator(nn.Module):
+class ResidualBlock(nn.Module):
 
-    def __init__(self, channel_dim=32, kernel=4, stride=2,
-                 padding=1, device='cuda'):
-        super(Discriminator, self).__init__()
+    def __init__(self, dim_in, dim_out):
+        super(ResidualBlock, self).__init__()
+        kernel_size = 3
+        stride = 1
+        padding = 1
+        self.main = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, kernel_size,
+                      stride, padding, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_out, dim_out, kernel_size,
+                      stride, padding, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True))
 
-        self.device = device
-        self.layers = nn.Sequential(
-                nn.Conv2d(3, channel_dim,
-                          kernel_size=kernel, stride=stride,
-                          padding=padding),
-                nn.LeakyReLU(0.2, inplace=True),
-                *self.block(channel_dim, channel_dim * 2,
-                            kernel=kernel, stride=stride,
-                            padding=padding),
-                *self.block(channel_dim * 2, channel_dim * 2,
-                            kernel=kernel, stride=stride,
-                            padding=padding),
-                *self.block(channel_dim * 2, channel_dim * 2,
-                            kernel=kernel, stride=stride,
-                            padding=0),
-            ).to(device)
-        self.class_layer = nn.Conv2d(channel_dim * 2, 1,
-                                     stride=1, kernel_size=3).to(device)
-        self.validity_layer = nn.Conv2d(channel_dim * 2, 1,
-                                        kernel_size=3).to(device)
-
-    def summary(self):
-        summary(self, (3, 64, 64), device=self.device)
-
-    def block(self, input_dim, output_dim, kernel, stride, padding):
-        return (
-            nn.Conv2d(input_dim, output_dim,
-                      kernel_size=kernel, stride=stride,
-                      padding=padding),
-            # nn.BatchNorm2d(output_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            )
-
-    def forward(self, images):
-        output = self.layers(images)
-        predicted_class = self.class_layer(output)
-        predicted_validity = self.validity_layer(output)
-        return torch.sigmoid(predicted_class).view(-1, 1), torch.sigmoid(predicted_validity).view(-1, 1)
+    def forward(self, x):
+        return x + self.main(x)
 
 
 class Generator(nn.Module):
 
-    def __init__(self, channel_dim=64, device='cuda'):
+    def __init__(self, conv_dim=64, c_dim=1, repeat_num=6):
         super(Generator, self).__init__()
 
-        self.device = device
-        self.layers = nn.Sequential(
-                # input layer
-                nn.Conv2d(4, channel_dim, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(channel_dim),
-                nn.ReLU(),
-                # downsample
-                nn.Conv2d(channel_dim, channel_dim * 2, kernel_size=3, stride=2, padding=1),
-                nn.BatchNorm2d(channel_dim * 2),
-                nn.ReLU(),
-                # bottleneck
-                nn.Conv2d(channel_dim * 2, channel_dim * 2, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(channel_dim * 2),
-                nn.ReLU(),
-                nn.Conv2d(channel_dim * 2, channel_dim * 2, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(channel_dim * 2),
-                nn.ReLU(),
-                nn.Conv2d(channel_dim * 2, channel_dim * 2, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(channel_dim * 2),
-                nn.ReLU(),
-                # upscale
-                nn.ConvTranspose2d(channel_dim * 2, channel_dim, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(channel_dim),
-                nn.ReLU(),
-                # ouput layer
-                nn.Conv2d(channel_dim, 3, kernel_size=3, stride=1, padding=1),
-                nn.Tanh(),
-                ).to(device)
+        layers = []
+        layers.append(nn.Conv2d(3+c_dim, conv_dim, kernel_size=7,
+                                stride=1, padding=3, bias=False))
+        layers.append(nn.InstanceNorm2d(conv_dim, affine=True,
+                                        track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
 
-    def summary(self):
-        summary(self, (3, 64, 64), device=self.device)
+        # Down-sampling layers.
+        curr_dim = conv_dim
+        for i in range(2):
+            layers.append(nn.Conv2d(curr_dim, curr_dim*2, kernel_size=4,
+                                    stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim*2, affine=True,
+                                            track_running_stats=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim * 2
 
-    def forward(self, images, classes):
-        classes = classes.view(classes.shape[0], classes.shape[1], 1, 1)
-        classes = classes.repeat(1, 1, images.shape[2], images.shape[3])
-        batch = torch.cat([images, classes], axis=1)
-        return self.layers(batch)
+        # Bottleneck layers.
+        for i in range(repeat_num):
+            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+
+        # Up-sampling layers.
+        for i in range(2):
+            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim//2,
+                                             kernel_size=4, stride=2,
+                                             padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True,
+                                            track_running_stats=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim // 2
+
+        layers.append(nn.Conv2d(curr_dim, 3,
+                                kernel_size=7, stride=1,
+                                padding=3, bias=False))
+        layers.append(nn.Tanh())
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x, c=None):
+        # just for summary
+        if c is None:
+            c = torch.ones([x.shape[0], 1]).to('cuda')
+        c = c.view(c.size(0), c.size(1), 1, 1)
+        c = c.repeat(1, 1, x.size(2), x.size(3))
+        x = torch.cat([x, c], dim=1)
+        return self.main(x)
+
+
+class Discriminator(nn.Module):
+
+    def __init__(self, image_size=64, conv_dim=64, c_dim=1, repeat_num=6):
+        super(Discriminator, self).__init__()
+        layers = []
+        layers.append(nn.Conv2d(3, conv_dim,
+                                kernel_size=4, stride=2, padding=1))
+        layers.append(nn.LeakyReLU(0.01))
+
+        curr_dim = conv_dim
+        for i in range(1, repeat_num):
+            layers.append(nn.Conv2d(curr_dim, curr_dim*2,
+                                    kernel_size=4, stride=2, padding=1))
+            layers.append(nn.LeakyReLU(0.01))
+            curr_dim = curr_dim * 2
+
+        kernel_size = int(image_size / np.power(2, repeat_num))
+        self.main = nn.Sequential(*layers)
+        self.conv1 = nn.Conv2d(curr_dim, 1,
+                               kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(curr_dim, c_dim,
+                               kernel_size=kernel_size, bias=False)
+
+    def forward(self, x):
+        h = self.main(x)
+        out_src = self.conv1(h)
+        out_cls = self.conv2(h)
+        return out_src, out_cls.view(out_cls.size(0), out_cls.size(1))
